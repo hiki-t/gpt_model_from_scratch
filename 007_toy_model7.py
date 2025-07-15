@@ -131,7 +131,7 @@ lora_config = peft.LoraConfig(
 )
 
 model = peft.get_peft_model(model, lora_config)
-model.gradient_checkpointing_enable()
+# model.gradient_checkpointing_enable()
 
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
