@@ -1,5 +1,6 @@
 import torch
 from torch.utils.data import DataLoader
+
 from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling, get_scheduler
 from transformers import TrainingArguments, Trainer
 
@@ -9,15 +10,20 @@ import json
 from typing import List, Dict
 import random
 from tqdm import tqdm
+import peft
+import os
 
 ###
+
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 ###
 
 class SummarizationDataProcessor:
-    def __init__(self, tokenizer, max_length=2048):
+    def __init__(self, tokenizer, max_length=512):
         self.tokenizer = tokenizer
         self.max_length = max_length
     # ... existing code ...
@@ -93,68 +99,6 @@ def load_and_prepare_data(dataset, tokenizer):
     )
     return tokenized_dataset
 
-# def train_sft_model(
-#     model_name: str = "Qwen/Qwen3-0.6B-Base",
-#     train_dataset=None, 
-#     val_dataset=None, 
-#     output_dir: str = "./trained_models/qwen-sft-summarization",
-#     num_epochs: int = 1,
-#     batch_size: int = 4,
-#     learning_rate: float = 5e-5
-# ):
-#     tokenizer = AutoTokenizer.from_pretrained(model_name)
-#     model = AutoModelForCausalLM.from_pretrained(
-#         model_name,
-#         torch_dtype=torch.float16,
-#         device_map="auto"
-#     )
-#     if tokenizer.pad_token is None:
-#         tokenizer.pad_token = tokenizer.eos_token
-#     processed_train_dataset = load_and_prepare_data(train_dataset, tokenizer)
-#     processed_val_dataset = load_and_prepare_data(val_dataset, tokenizer)
-#     training_args = TrainingArguments(
-#         output_dir=output_dir,
-#         num_train_epochs=num_epochs,
-#         per_device_train_batch_size=batch_size,
-#         gradient_accumulation_steps=4,
-#         warmup_steps=500,
-#         learning_rate=learning_rate,
-#         logging_steps=100,
-#         save_steps=1000,
-#         eval_strategy="no",
-#         save_strategy="steps",
-#         fp16=True,
-#         dataloader_drop_last=True,
-#         remove_unused_columns=False,
-#         # report_to="tensorboard", 
-#         push_to_hub=True, 
-#         hub_model_id="hiki-t/gpt_qwen_from_scratch", 
-#     )
-
-#     data_collator = DataCollatorForLanguageModeling(
-#         tokenizer=tokenizer,
-#         mlm=False,
-#         pad_to_multiple_of=8,
-#         return_tensors="pt"
-#     )
-
-#     trainer = Trainer(
-#         model=model,
-#         args=training_args,
-#         train_dataset=processed_train_dataset, 
-#         eval_dataset=processed_val_dataset, 
-#         tokenizer=tokenizer,
-#         data_collator=data_collator
-#     )
-
-#     trainer.train()
-#     trainer.save_model(output_dir) # Save model in HuggingFace format (for later push)
-#     tokenizer.save_pretrained(output_dir)
-#     # Save as sft_model.pt (PyTorch state_dict)
-#     torch.save(model.state_dict(), f"{output_dir}/sft_model.pt")
-
-#     return model, tokenizer
-
 ###
 
 # Load your dataset
@@ -177,6 +121,18 @@ model = AutoModelForCausalLM.from_pretrained(
     device_map="auto"
 )
 
+lora_config = peft.LoraConfig(
+    r=4,                         # Rank (typical: 4, 8, or 16)
+    lora_alpha=8,               # Alpha scaling factor
+    # target_modules=["q_proj", "v_proj"],  # Depends on model architecture
+    lora_dropout=0.1,           # Dropout applied to LoRA layers
+    bias="none",                 # Can be "none", "all", or "lora_only"
+    task_type="CAUSAL_LM"  # For decoder-only models like Qwen
+)
+
+model = peft.get_peft_model(model, lora_config)
+model.gradient_checkpointing_enable()
+
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -195,8 +151,19 @@ data_collator = DataCollatorForLanguageModeling(
 train_dataloader = DataLoader(
     processed_train_dataset,
     shuffle=True,
-    batch_size=4,
-    collate_fn=data_collator
+    batch_size=batch_size,
+    collate_fn=data_collator, 
+    num_workers=8, 
+    pin_memory=True
+)
+
+val_dataloader = DataLoader(
+    processed_val_dataset,
+    shuffle=True,
+    batch_size=batch_size,
+    collate_fn=data_collator, 
+    num_workers=8, 
+    pin_memory=True
 )
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
@@ -209,21 +176,45 @@ lr_scheduler = get_scheduler(
     num_training_steps=num_training_steps
 )
 
+scaler = torch.GradScaler("cuda")
 
 model.train()
 for epoch in range(num_epochs):
     print(f"Epoch {epoch+1}/{num_epochs}")
-    progress_bar = tqdm(train_dataloader)
-    for batch in progress_bar:
-        batch = {k: v.to(device) for k, v in batch.items()}
-        outputs = model(**batch)
-        loss = outputs.loss
-        loss.backward()
+    total_loss = 0.0
+    model.train()
 
-        optimizer.step()
+    progress_bar = tqdm(train_dataloader, desc="Training")
+    for step, batch in enumerate(progress_bar):
+        batch = {k: v.to(device) for k, v in batch.items()}
+
+        with torch.autocast("cuda"):
+            outputs = model(**batch)
+            loss = outputs.loss
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        # outputs = model(**batch)
+        # loss = outputs.loss
+        # loss.backward()
+        # optimizer.step()
         lr_scheduler.step()
         optimizer.zero_grad()
 
-        progress_bar.set_description(f"Loss: {loss.item():.4f}")
-        break
+        total_loss += loss.item()
+        avg_loss = total_loss / (step + 1)
+        progress_bar.set_description(f"Train Loss: {avg_loss:.4f}")
 
+# Validation phase
+model.eval()
+val_loss = 0.0
+with torch.no_grad():
+    val_progress = tqdm(val_dataloader, desc="Validation")
+    for step, batch in enumerate(val_progress):
+        batch = {k: v.to(device) for k, v in batch.items()}
+        outputs = model(**batch)
+        loss = outputs.loss
+        val_loss += loss.item()
+        avg_val_loss = val_loss / (step + 1)
+        val_progress.set_description(f"Val Loss: {avg_val_loss:.4f}")
