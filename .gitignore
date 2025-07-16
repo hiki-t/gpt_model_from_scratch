@@ -37,3 +37,4 @@ trained_model
 # ignore these dir
 myenv
 wandb
+
