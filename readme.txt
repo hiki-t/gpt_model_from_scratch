@@ -22,6 +22,10 @@ wandb login
 # Add Your Virtual Environment as a Jupyter Kernel
 # python -m ipykernel install --user --name=myenv --display-name "Python (myenv)"
 
+# download VS code Python's extention
+# and maybe jupyter notebook extention
+
 # to access target venv environment from vscode on remote server
 # at first, need to setup with Python: Select Interpreter command from the Command Palette (Ctrl+Shift+P)
 # then the target env is accessible through select Kernel
+# enter interpreter path ... --> find ... --> myenv/bin/python
